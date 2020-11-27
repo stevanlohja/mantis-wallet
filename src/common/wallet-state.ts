@@ -1,4 +1,4 @@
-import {useState} from 'react'
+import {useEffect, useState} from 'react'
 import BigNumber from 'bignumber.js'
 import _ from 'lodash/fp'
 import {createContainer} from 'unstated-next'
@@ -6,14 +6,17 @@ import {getOrElse, isNone, isSome, none, Option, some} from 'fp-ts/lib/Option'
 import {pipe} from 'fp-ts/lib/pipeable'
 import {Account as Web3Account, EncryptedKeystoreV3Json, TransactionConfig} from 'web3-core'
 import {option} from 'fp-ts'
+import {Observable, of} from 'rxjs'
 import {rendererLog} from './logger'
 import {createInMemoryStore, Store} from './store'
 import {usePersistedState} from './hook-utils'
 import {prop} from '../shared/utils'
 import {createTErrorRenderer} from './i18n'
-import {toHex} from './util'
+import {toHex, useObservable} from './util'
 import {asEther, asWei, Wei} from './units'
-import {AccountTransaction, CustomErrors, defaultWeb3, MantisWeb3} from '../web3'
+import {CustomErrors, defaultWeb3, MantisWeb3} from '../web3'
+import {TransactionHistoryService} from '../wallets/history/TransactionHistoryService'
+import {TxHistoryStoreData, Transaction, defaultTxHistoryStoreData} from '../wallets/history'
 
 interface SynchronizationStatusOffline {
   mode: 'offline'
@@ -42,28 +45,10 @@ export const allFeeLevels = ['low', 'medium', 'high'] as const
 export type FeeLevel = typeof allFeeLevels[number]
 export type FeeEstimates = Record<FeeLevel, Wei>
 
-export interface Transaction {
-  from: string
-  to: string | null
-  hash: string
-  blockNumber: number | null
-  timestamp: Date | null
-  value: Wei
-  gasPrice: Wei
-  gasUsed: number | null
-  fee: Wei
-  gas: number
-  direction: 'outgoing' | 'incoming'
-  status: 'pending' | 'confirmed' | 'persisted' | 'failed'
-  contractAddress: string | null
-}
-
-const DEPTH_FOR_PERSISTENCE = 12
 export const TRANSFER_GAS_LIMIT = 21000
 export const MIN_GAS_PRICE = asWei(1)
 
 // States
-
 export interface InitialState {
   walletStatus: 'INITIAL'
   refreshSyncStatus: () => Promise<void>
@@ -124,7 +109,7 @@ export type WalletData = InitialState | LoadingState | LoadedState | NoWalletSta
 interface Overview {
   availableBalance: Option<Wei>
   pendingBalance: Wei
-  transactions: Transaction[]
+  transactions: readonly Transaction[]
 }
 
 interface StoredAccount {
@@ -134,7 +119,7 @@ interface StoredAccount {
 }
 
 export interface StoreWalletData {
-  wallet: {
+  wallet: TxHistoryStoreData & {
     accounts: StoredAccount[]
     addressBook: Record<string, string>
   }
@@ -142,6 +127,7 @@ export interface StoreWalletData {
 
 export const defaultWalletData: StoreWalletData = {
   wallet: {
+    ...defaultTxHistoryStoreData,
     accounts: [],
     addressBook: {},
   },
@@ -151,6 +137,7 @@ interface WalletStateParams {
   walletStatus: WalletStatus
   web3: MantisWeb3
   store: Store<StoreWalletData>
+  txHistory: TransactionHistoryService
   error: Option<Error>
   syncStatus: Option<SynchronizationStatus>
   totalBalance: Option<Wei>
@@ -164,6 +151,7 @@ const DEFAULT_STATE: WalletStateParams = {
   walletStatus: 'INITIAL',
   web3: defaultWeb3(),
   store: createInMemoryStore(defaultWalletData),
+  txHistory: TransactionHistoryService.fake,
   error: none,
   syncStatus: none,
   totalBalance: none,
@@ -176,10 +164,10 @@ const DEFAULT_STATE: WalletStateParams = {
 export const canRemoveWallet = (walletState: WalletData): walletState is LoadedState | ErrorState =>
   walletState.walletStatus === 'LOADED' || walletState.walletStatus === 'ERROR'
 
-export const getNextNonce = (transactions: Transaction[]): number =>
+export const getNextNonce = (transactions: readonly Transaction[]): number =>
   transactions.filter((tx) => tx.direction === 'outgoing').length
 
-export const getPendingBalance = (transactions: Transaction[]): BigNumber =>
+export const getPendingBalance = (transactions: readonly Transaction[]): BigNumber =>
   transactions
     .filter((tx) => tx.status === 'pending' && tx.direction === 'outgoing')
     .map((tx) => tx.value.plus(tx.fee))
@@ -192,18 +180,9 @@ export const canResetWallet = (
   walletState.walletStatus === 'ERROR' ||
   walletState.walletStatus === 'NO_WALLET'
 
-const getStatus = (
-  currentBlock: number,
-  txBlock: number | null,
-  isPending: boolean,
-): Transaction['status'] => {
-  if (isPending || txBlock === null) return 'pending'
-  return currentBlock - txBlock >= DEPTH_FOR_PERSISTENCE ? 'persisted' : 'confirmed'
-}
-
 function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
   const _initialState = _.merge(DEFAULT_STATE)(initialState)
-  const {web3, isMocked} = _initialState
+  const {web3, isMocked, txHistory} = _initialState
 
   // wallet
   const [storedAccounts, setStoredAccounts] = usePersistedState(_initialState.store, [
@@ -228,9 +207,26 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
   )
 
   // transactions
-  const [transactionsOption, setTransactions] = useState<Option<Transaction[]>>(
-    _initialState.transactions,
+  const [historyObservable, setHistoryObservable] = useState<Observable<readonly Transaction[]>>(
+    of([]),
   )
+  useEffect(() => {
+    pipe(
+      currentAddressOption,
+      option.fold(
+        () => {
+          console.log('No account, returning empty observable')
+          return of([])
+        },
+        (account) => {
+          console.log('Started watching account', account)
+          return txHistory.watchAccount(account)
+        },
+      ),
+      setHistoryObservable,
+    )
+  }, [currentAddressOption])
+  const transactions = useObservable([], historyObservable)
 
   // addresses / accounts
   const [accountsOption, setAccounts] = useState<Option<Account[]>>(_initialState.accounts)
@@ -253,7 +249,6 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
   const accounts = getOrElse((): Account[] => [])(accountsOption)
 
   const getOverviewProps = (): Overview => {
-    const transactions = getOrElse((): Transaction[] => [])(transactionsOption)
     const totalBalance = getOrElse(() => asWei(0))(totalBalanceOption)
     const availableBalance = getOrElse(() => asWei(0))(availableBalanceOption)
     const pendingBalance = asWei(totalBalance.minus(availableBalance))
@@ -265,8 +260,7 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
     }
   }
 
-  const isLoaded = (): boolean =>
-    isSome(transactionsOption) && isSome(accountsOption) && isSome(syncStatusOption)
+  const isLoaded = (): boolean => isSome(accountsOption) && isSome(syncStatusOption)
 
   const walletStatus =
     walletStatus_ === 'LOADING' && (isMocked || isLoaded()) ? 'LOADED' : walletStatus_
@@ -282,7 +276,6 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
     setWalletStatus(status)
     setTotalBalance(none)
     setAvailableBalance(none)
-    setTransactions(none)
     setError(none)
     setSyncStatus(none)
   }
@@ -383,7 +376,7 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
   //   return _.fromPairs(tokenBalances)
   // }
 
-  const loadBalance = async (transactions: Transaction[]): Promise<void> => {
+  const loadBalance = async (transactions: readonly Transaction[]): Promise<void> => {
     const address = getCurrentAddress()
     const balance = await fetchBalance(address)
     const pendingBalance = getPendingBalance(transactions)
@@ -397,45 +390,8 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
     setTotalBalance(balance)
   }
 
-  const loadTransactionHistory = async (): Promise<void> => {
-    const currentAddress = getCurrentAddress()
-    const currentBlock = await web3.eth.getBlockNumber()
-
-    const web3transactions: readonly AccountTransaction[] = await web3.mantis.getAccountTransactions(
-      currentAddress,
-      Math.max(0, currentBlock - 1000),
-      currentBlock,
-    )
-
-    const transactions = await Promise.all(
-      web3transactions.map(
-        async (tx): Promise<Transaction> => {
-          return {
-            ...tx,
-            timestamp: tx.timestamp || null,
-            gasUsed: tx.gasUsed || null,
-            value: asWei(tx.value),
-            gasPrice: asWei(tx.gasPrice),
-            fee: tx.isOutgoing
-              ? asWei(new BigNumber(tx.gasPrice).times(tx.gasUsed || tx.gas))
-              : asWei(0),
-            direction: tx.isOutgoing ? 'outgoing' : 'incoming',
-            status: getStatus(currentBlock, tx.blockNumber, tx.isPending || false),
-            contractAddress:
-              tx.to == null
-                ? (await web3.eth.getTransactionReceipt(tx.hash))?.contractAddress || null
-                : null,
-          }
-        },
-      ),
-    )
-
-    setTransactions(some(transactions))
-    await loadBalance(transactions)
-  }
-
   const load = (
-    loadFns: Array<() => Promise<void>> = [loadTransactionHistory, loadAccounts],
+    loadFns: Array<() => Promise<void>> = [() => loadBalance(transactions), loadAccounts],
   ): void => {
     setWalletStatus('LOADING')
     loadFns.forEach((fn) => fn().catch(handleError))
@@ -540,7 +496,8 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
     if (tx.rawTransaction === undefined) {
       throw createTErrorRenderer(['wallet', 'error', 'couldNotSignTransaction'])
     }
-    web3.eth.sendSignedTransaction(tx.rawTransaction) // ETCM-134
+    await web3.eth.sendSignedTransaction(tx.rawTransaction) // ETCM-134
+    txHistory.explicitChecks.next()
   }
 
   const doTransfer = async (
@@ -549,7 +506,6 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
     fee: Wei,
     password: string,
   ): Promise<void> => {
-    const transactions = getOrElse((): Transaction[] => [])(transactionsOption)
     const nonce = getNextNonce(transactions)
 
     return sendTransaction({
@@ -577,12 +533,14 @@ function useWalletState(initialState?: Partial<WalletStateParams>): WalletData {
   }
 
   const remove = async (password: string): Promise<boolean> => {
+    console.log('removing wallet')
     const currentAddress = getCurrentAddress()
     decryptCurrentAccount(password)
 
     reset('NO_WALLET')
     setStoredAccounts(storedAccounts.filter(({address}) => address !== currentAddress))
     setCurrentAddressOption(none)
+    await txHistory.clean()
     return true
   }
 

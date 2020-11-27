@@ -5,7 +5,6 @@ import {Wei, etherValue} from '../../common/units'
 import {DialogTextSwitch} from '../../common/dialog/DialogTextSwitch'
 import {
   FeeEstimates,
-  Transaction,
   getNextNonce,
   TRANSFER_GAS_LIMIT,
   MIN_GAS_PRICE,
@@ -17,6 +16,7 @@ import {
   ConfirmBasicTransaction,
   ConfirmAdvancedTransaction,
 } from '../sendTransaction'
+import {Transaction} from '../history'
 
 enum TransactionType {
   basic = 'BASIC',
@@ -46,7 +46,7 @@ interface TransactionParams {
 interface SendTransactionFlowProps {
   availableAmount: Wei
   estimateTransactionFee: () => Promise<FeeEstimates>
-  transactions: Transaction[]
+  transactions: readonly Transaction[]
   onCancel: () => void
 }
 
